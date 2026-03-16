@@ -1,6 +1,5 @@
 # dynatrace-instrumented-hosts-report
 
-# dynatrace-host-memory-report
 
 A Node.js script that identifies Dynatrace-monitored hosts with deep (code-level) instrumentation or backing a Kubernetes node, fetches their memory footprint, and outputs a CSV report.
 
