@@ -215,6 +215,15 @@ function csvEscape(val) {
 const BYTES_PER_GIB = 1024 ** 3;
 const toGiB = (bytes) => (Number(bytes) / BYTES_PER_GIB).toFixed(2);
 
+// DPS app-only billing: round up to nearest 0.25 GiB, 256 MiB minimum.
+// https://docs.dynatrace.com/docs/shortlink/dps-full-stack#app-only-gib-hour
+const BILLING_MIN_BYTES = 256 * 1024 * 1024;
+const BILLING_STEP_GIB = 0.25;
+const toBillingGiB = (bytes) => {
+  const effective = Math.max(Number(bytes), BILLING_MIN_BYTES);
+  return (Math.ceil((effective / BYTES_PER_GIB) / BILLING_STEP_GIB) * BILLING_STEP_GIB).toFixed(2);
+};
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -235,7 +244,7 @@ async function main() {
   }
   console.error();
 
-  const EMPTY_HEADER = "displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB";
+  const EMPTY_HEADER = "displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB,billingMemoryGiB";
 
   // ------------------------------------------------------------------
   // Step 1: Collect deep-monitored PGIs
@@ -441,7 +450,7 @@ async function main() {
   // ------------------------------------------------------------------
   // Build CSV
   // ------------------------------------------------------------------
-  const header = "displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB";
+  const header = "displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB,billingMemoryGiB";
 
   const rows = cgIds.map((cgId) => {
     const { displayName, clusterEntityIds, namespaceNames } = cgMap.get(cgId);
@@ -464,6 +473,7 @@ async function main() {
       hasLimits,
       memoryBytes ?? "",
       memoryBytes != null ? toGiB(memoryBytes) : "",
+      memoryBytes != null ? toBillingGiB(memoryBytes) : "",
     ].join(",");
   });
 

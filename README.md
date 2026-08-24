@@ -144,9 +144,9 @@ node container-group-memory-report.js --ns unguard
 ### Output
 
 ```csv
-displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB
-dynatrace-operator-*,CONTAINER_GROUP-9FB31EC,dynakube,dynatrace,true,134217728,0.13
-unguard-frontend-*,CONTAINER_GROUP-188BAEB,eks-demo-ap-southeast-2,unguard,false,2638745231,2.46
+displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB,billingMemoryGiB
+dynatrace-operator-*,CONTAINER_GROUP-9FB31EC,dynakube,dynatrace,true,134217728,0.13,0.25
+unguard-frontend-*,CONTAINER_GROUP-188BAEB,eks-demo-ap-southeast-2,unguard,false,2638745231,2.46,2.50
 ```
 
 | Column | Description |
@@ -156,8 +156,9 @@ unguard-frontend-*,CONTAINER_GROUP-188BAEB,eks-demo-ap-southeast-2,unguard,false
 | `clusterName` | Kubernetes cluster name(s), semicolon-separated if the workload spans multiple clusters |
 | `namespace` | Kubernetes namespace(s), semicolon-separated if multiple |
 | `hasLimits` | `true` if K8s memory limits are set in the pod spec; `false` if using utilization fallback |
-| `memoryBytes` | Memory limit (bytes) when `hasLimits=true`; working set utilization (bytes) when `hasLimits=false` |
+| `memoryBytes` | Raw memory value in bytes — limit when `hasLimits=true`, working set utilization when `hasLimits=false` |
 | `memoryGiB` | Same value in GiB (2 decimal places) |
+| `billingMemoryGiB` | DPS billing size: `memoryGiB` rounded **up** to the nearest 0.25 GiB, with a 256 MiB minimum floor. See [DPS app-only GiB-hour](https://docs.dynatrace.com/docs/shortlink/dps-full-stack#app-only-gib-hour). |
 
 ---
 
