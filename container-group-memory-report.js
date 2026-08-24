@@ -302,12 +302,18 @@ async function main() {
     "fromRelationships.isInstanceOf,fromRelationships.isCgiOfCai,fromRelationships.isCgiOfCa,fromRelationships.isCgiOfCluster,properties"
   );
 
-  // CG ID → { displayName, caiIds, caIds, clusterEntityIds, namespaceNames }
+  // CG ID → { displayName, caIds, clusterEntityIds }
   const cgMap = new Map();
   // CAI ID → CG ID
   const caiToCg = new Map();
-  // CA ID → CG ID (for working set metric query)
+  // CA ID → CG ID
   const caToCg = new Map();
+  // CA ID → cluster entity ID (CA is cluster-specific)
+  const caToCluster = new Map();
+  // CAI ID → cluster entity ID (pod runs on one cluster)
+  const caiToCluster = new Map();
+  // CG ID → Map<clusterId, namespace string>
+  const cgClusterNamespace = new Map();
 
   for (const cgi of cgiEntities) {
     const cgRels = cgi.fromRelationships?.isInstanceOf || [];
@@ -319,35 +325,34 @@ async function main() {
     // Apply namespace filter if specified
     if (NAMESPACE_FILTER && namespaceName !== NAMESPACE_FILTER) continue;
 
+    const clusterId = clusterRels.find((r) => r.id?.startsWith("KUBERNETES_CLUSTER-"))?.id ?? null;
+
     for (const cgRel of cgRels) {
       if (!cgRel.id?.startsWith("CONTAINER_GROUP-")) continue;
       const cgId = cgRel.id;
 
       if (!cgMap.has(cgId)) {
-        cgMap.set(cgId, {
-          displayName: cgId,
-          caiIds: new Set(),
-          caIds: new Set(),
-          clusterEntityIds: new Set(),
-          namespaceNames: new Set(),
-        });
+        cgMap.set(cgId, { displayName: cgId, caIds: new Set(), clusterEntityIds: new Set() });
+        cgClusterNamespace.set(cgId, new Map());
       }
 
       const entry = cgMap.get(cgId);
-      if (namespaceName) entry.namespaceNames.add(namespaceName);
-      for (const clRel of clusterRels) {
-        if (clRel.id?.startsWith("KUBERNETES_CLUSTER-")) entry.clusterEntityIds.add(clRel.id);
+      if (clusterId) {
+        entry.clusterEntityIds.add(clusterId);
+        if (namespaceName) cgClusterNamespace.get(cgId).set(clusterId, namespaceName);
       }
+
       for (const caiRel of caiRels) {
         if (caiRel.id?.startsWith("CLOUD_APPLICATION_INSTANCE-")) {
-          entry.caiIds.add(caiRel.id);
           caiToCg.set(caiRel.id, cgId);
+          if (clusterId) caiToCluster.set(caiRel.id, clusterId);
         }
       }
       for (const caRel of caRels) {
         if (caRel.id?.startsWith("CLOUD_APPLICATION-")) {
           entry.caIds.add(caRel.id);
           caToCg.set(caRel.id, cgId);
+          if (clusterId) caToCluster.set(caRel.id, clusterId);
         }
       }
     }
@@ -363,61 +368,49 @@ async function main() {
   // ------------------------------------------------------------------
   console.error("=== Step 4: Fetching pod memory limits/requests ===\n");
 
-  // CG ID → { instanceCount, requestsBytes, limitsBytes }
-  const cgLimits = new Map();
-  for (const cgId of cgMap.keys()) {
-    cgLimits.set(cgId, { instanceCount: 0, requestsBytes: 0, limitsBytes: 0 });
-  }
+  // CG ID → Map<clusterId, { limitsBytes }>
+  const cgClusterLimits = new Map();
+  for (const cgId of cgMap.keys()) cgClusterLimits.set(cgId, new Map());
 
   if (allCaiIds.length > 0) {
     const caiEntities = await getEntitiesById(allCaiIds, "properties");
 
     for (const cai of caiEntities) {
       const cgId = caiToCg.get(cai.entityId);
-      if (!cgId) continue;
+      const clusterId = caiToCluster.get(cai.entityId);
+      if (!cgId || !clusterId) continue;
 
-      const lim = cgLimits.get(cgId);
       const limitsMemory = cai.properties?.limitsMemory;
-      const requestsMemory = cai.properties?.requestsMemory;
+      if (limitsMemory == null) continue;
 
-      if (limitsMemory != null || requestsMemory != null) {
-        lim.instanceCount++;
-        if (limitsMemory != null) lim.limitsBytes += Number(limitsMemory);
-        if (requestsMemory != null) lim.requestsBytes += Number(requestsMemory);
-      }
+      const clusterMap = cgClusterLimits.get(cgId);
+      if (!clusterMap.has(clusterId)) clusterMap.set(clusterId, { limitsBytes: 0 });
+      clusterMap.get(clusterId).limitsBytes += Number(limitsMemory);
     }
   }
 
-  // Determine which CGs have no limits set
   const cgIds = [...cgMap.keys()];
-  const noLimitsCgIds = cgIds.filter((id) => cgLimits.get(id).limitsBytes === 0);
-  console.error(`\nContainer Groups with limits: ${cgIds.length - noLimitsCgIds.length}`);
-  console.error(`Container Groups without limits (will use utilization): ${noLimitsCgIds.length}\n`);
+  const cgWithLimits = cgIds.filter((id) => [...cgClusterLimits.get(id).values()].some((e) => e.limitsBytes > 0));
+  console.error(`\nContainer Groups with limits: ${cgWithLimits.length}`);
+  console.error(`Container Groups without limits (will use utilization): ${cgIds.length - cgWithLimits.length}\n`);
 
   // ------------------------------------------------------------------
-  // Step 5: Fetch current utilization for CGs without limits
+  // Step 5: Fetch working set for all CAs (per-CA, so per cluster/workload)
   // ------------------------------------------------------------------
-  const cgUtilization = new Map();
+  // caToWorkingSet: CA ID → bytes; queried for all CAs so per-(CG, cluster) rows
+  // can use limits when set and working set when not, independently per cluster.
+  const caToWorkingSet = new Map();
 
-  if (noLimitsCgIds.length > 0) {
+  const allCaIds = [...caToCg.keys()];
+  if (allCaIds.length > 0) {
     console.error("=== Step 5: Fetching working set memory (kubelet eviction metric) ===\n");
+    console.error(`Querying builtin:kubernetes.workload.memory_working_set for ${allCaIds.length} workloads…\n`);
 
-    // Collect the CLOUD_APPLICATION IDs that belong to limit-less CGs
-    const caIdsForUtilization = [...new Set(noLimitsCgIds.flatMap((cgId) => [...cgMap.get(cgId).caIds]))];
-    console.error(`Querying builtin:kubernetes.workload.memory_working_set for ${caIdsForUtilization.length} workloads…\n`);
-
-    const caToBytes = await getCaWorkingSetMemory(caIdsForUtilization);
+    const caToBytes = await getCaWorkingSetMemory(allCaIds);
     console.error(`  Metric values received for ${caToBytes.size} workloads`);
-
-    // Map CA results back to CG
-    for (const [caId, bytes] of caToBytes) {
-      const cgId = caToCg.get(caId);
-      if (!cgId) continue;
-      // A CG may map to multiple CAs (e.g. across clusters); sum them
-      cgUtilization.set(cgId, (cgUtilization.get(cgId) || 0) + bytes);
-    }
+    for (const [caId, bytes] of caToBytes) caToWorkingSet.set(caId, bytes);
   } else {
-    console.error("=== Step 5: Skipped (all Container Groups have limits) ===\n");
+    console.error("=== Step 5: Skipped (no CLOUD_APPLICATION entities found) ===\n");
   }
 
   // ------------------------------------------------------------------
@@ -452,30 +445,55 @@ async function main() {
   // ------------------------------------------------------------------
   const header = "displayName,entityId,clusterName,namespace,hasLimits,memoryBytes,memoryGiB,billingMemoryGiB";
 
-  const rows = cgIds.map((cgId) => {
-    const { displayName, clusterEntityIds, namespaceNames } = cgMap.get(cgId);
-    const { limitsBytes } = cgLimits.get(cgId);
-    const hasLimits = limitsBytes > 0;
-    const utilizationBytes = cgUtilization.get(cgId);
+  const rows = [];
+  for (const cgId of cgIds) {
+    const { displayName, caIds } = cgMap.get(cgId);
 
-    // Coalesce: limits when available, working set utilization otherwise
-    const memoryBytes = hasLimits ? limitsBytes : (utilizationBytes != null ? Math.round(utilizationBytes) : null);
+    // Group this CG's CAs by cluster — each CA is cluster-specific
+    const clusterToCaIds = new Map();
+    for (const caId of caIds) {
+      const clusterId = caToCluster.get(caId);
+      if (clusterId) {
+        if (!clusterToCaIds.has(clusterId)) clusterToCaIds.set(clusterId, []);
+        clusterToCaIds.get(clusterId).push(caId);
+      }
+    }
 
-    const clusterNames = [...clusterEntityIds]
-      .map((id) => clusterIdToName.get(id) || id)
-      .sort();
+    // No K8s workload entity (e.g. bare container) — emit one row with no cluster/memory
+    if (clusterToCaIds.size === 0) {
+      rows.push([csvEscape(displayName), csvEscape(cgId), "", "", "", "", "", ""].join(","));
+      continue;
+    }
 
-    return [
-      csvEscape(displayName),
-      csvEscape(cgId),
-      csvEscape(clusterNames.join(";")),
-      csvEscape([...namespaceNames].sort().join(";")),
-      hasLimits,
-      memoryBytes ?? "",
-      memoryBytes != null ? toGiB(memoryBytes) : "",
-      memoryBytes != null ? toBillingGiB(memoryBytes) : "",
-    ].join(",");
-  });
+    for (const [clusterId, clusterCaIds] of [...clusterToCaIds].sort()) {
+      const clusterName = clusterIdToName.get(clusterId) || clusterId;
+      const namespace = cgClusterNamespace.get(cgId)?.get(clusterId) || "";
+
+      const limitsBytes = cgClusterLimits.get(cgId)?.get(clusterId)?.limitsBytes ?? 0;
+      const hasLimits = limitsBytes > 0;
+
+      const workingSetBytes = clusterCaIds.reduce((sum, caId) => {
+        const v = caToWorkingSet.get(caId);
+        return v != null ? sum + v : sum;
+      }, 0);
+
+      // Coalesce: limits when set for this cluster, working set otherwise
+      const memoryBytes = hasLimits
+        ? limitsBytes
+        : (workingSetBytes > 0 ? Math.round(workingSetBytes) : null);
+
+      rows.push([
+        csvEscape(displayName),
+        csvEscape(cgId),
+        csvEscape(clusterName),
+        csvEscape(namespace),
+        hasLimits,
+        memoryBytes ?? "",
+        memoryBytes != null ? toGiB(memoryBytes) : "",
+        memoryBytes != null ? toBillingGiB(memoryBytes) : "",
+      ].join(","));
+    }
+  }
 
   rows.sort();
 
